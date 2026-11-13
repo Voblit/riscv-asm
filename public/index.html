@@ -7,90 +7,573 @@
 <style>
   :root { color-scheme: dark; }
   html, body { height: 100%; margin: 0; background: #0a0a0a; color: #4ade80;
-    font: 14px/1.5 ui-monospace, Menlo, Consolas, monospace; }
+    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   body { display: flex; flex-direction: column; }
-  header { display: flex; gap: 10px; align-items: center; padding: 8px 12px; background: #161616; color: #aaa; font-family: system-ui, sans-serif; }
-  header button { background: #2a2a2a; color: #ddd; border: 0; border-radius: 4px; padding: 5px 12px; }
+  header { display: flex; gap: 10px; align-items: center; padding: 8px 12px; background: #161616;
+    border-bottom: 1px solid #2a2a2a; color: #aaa; font-family: system-ui, sans-serif; }
+  header button { background: #2a2a2a; color: #ddd; border: 0; border-radius: 4px; padding: 5px 12px; cursor: pointer; }
   header span { flex: 1; text-align: right; }
-  #out { flex: 1; margin: 0; padding: 12px; overflow-y: auto; white-space: pre-wrap; word-break: break-word; }
+  #term { flex: 1; margin: 0; padding: 12px; overflow-y: auto; white-space: pre-wrap; word-break: break-word; }
+  .err { color: #f87171; } .sys { color: #60a5fa; } .in { color: #fbbf24; }
   #line { display: flex; border-top: 1px solid #2a2a2a; }
   #line b { padding: 8px 0 8px 12px; color: #fbbf24; }
   #stdin { flex: 1; background: transparent; border: 0; outline: 0; color: #fbbf24; font: inherit; padding: 8px; }
-  /* the real CheerpJ console: present and focusable, but not visible */
-  #console { position: fixed; left: -9999px; top: 0; width: 600px; height: 200px; overflow: auto; }
+  body.drag #term { outline: 2px dashed #60a5fa; outline-offset: -8px; }
 </style>
 </head>
 <body>
 <header>
   <button id="pick">Open .s file</button>
   <button id="rerun">Re-run</button>
-  <span id="status">Loading Java runtime…</span>
+  <button id="kill">Stop</button>
+  <button id="clear">Clear</button>
+  <span id="status">Drop a .s file anywhere</span>
   <input type="file" id="file" accept=".s,.asm,.S,.txt" hidden>
 </header>
-<pre id="out"></pre>
-<div id="line"><b>&gt;</b><input id="stdin" placeholder="stdin (Enter to send)" autocomplete="off"></div>
-<pre id="console" tabindex="0"></pre>
-
-<script src="https://cjrtnc.leaningtech.com/3.0/cj3loader.js"></script>
+<pre id="term"></pre>
+<div id="line"><b>&gt;</b><input id="stdin" placeholder="stdin (Enter to send)" autocomplete="off" disabled></div>
 <script>
 const $ = id => document.getElementById(id);
-const con = $('console'), out = $('out');
-let started = false;
+const term = $('term'), stdin = $('stdin'), status = $('status');
+const TEXT = 0x400000, DATA = 0x10010000;
+const enc = new TextEncoder(), dec = new TextDecoder();
 
-// 1. mirror everything CheerpJ prints into our own view
-new MutationObserver(() => {
-  out.textContent = con.textContent;
-  out.scrollTop = out.scrollHeight;
-}).observe(con, { childList: true, characterData: true, subtree: true });
-
-// 2. our input box -> keystrokes into the hidden console
-function press(ch) {
-  const enter = ch === 'Enter';
-  const code = enter ? 13 : ch.charCodeAt(0);
-  const init = { key: ch, code: enter ? 'Enter' : '', keyCode: code, charCode: code,
-                 which: code, bubbles: true, cancelable: true };
-  con.dispatchEvent(new KeyboardEvent('keydown', init));
-  con.dispatchEvent(new KeyboardEvent('keypress', init));
-  if (!enter) con.dispatchEvent(new InputEvent('input', { data: ch, inputType: 'insertText', bubbles: true }));
-  con.dispatchEvent(new KeyboardEvent('keyup', init));
+const names = ['zero','ra','sp','gp','tp','t0','t1','t2','s0','s1','a0','a1','a2','a3','a4','a5','a6','a7',
+  's2','s3','s4','s5','s6','s7','s8','s9','s10','s11','t3','t4','t5','t6'];
+const regMap = Object.create(null);
+regMap.fp = 8;
+names.forEach((n, i) => { regMap[n] = i; regMap['x' + i] = i; });
+function reg(s) {
+  const k = s.trim().toLowerCase();
+  if (!(k in regMap)) throw new Error("bad register '" + s + "'");
+  return regMap[k];
 }
 
-$('stdin').addEventListener('keydown', e => {
-  if (e.key !== 'Enter') return;
-  e.preventDefault();
-  con.focus();
-  for (const ch of e.target.value) press(ch);
-  press('Enter');
-  e.target.value = '';
-  e.target.focus();
+const ESC = { n: '\n', t: '\t', r: '\r', '0': '\0', '\\': '\\', '"': '"', "'": "'", b: '\b', f: '\f' };
+function unq(tok) {
+  if (tok.length < 2 || tok[0] !== '"' || tok[tok.length - 1] !== '"') throw new Error('bad string ' + tok);
+  const b = tok.slice(1, -1);
+  let o = '';
+  for (let i = 0; i < b.length; i++) {
+    let c = b[i];
+    if (c === '\\') { c = b[++i]; o += (c in ESC) ? ESC[c] : c; } else o += c;
+  }
+  return o;
+}
+function charVal(s) {
+  if (s.length < 3 || s[s.length - 1] !== "'") throw new Error('bad character literal ' + s);
+  const inner = s.slice(1, -1);
+  if (inner[0] === '\\') return ((inner[1] in ESC) ? ESC[inner[1]] : inner[1]).charCodeAt(0);
+  return inner.charCodeAt(0);
+}
+function stripComment(s) {
+  let q = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q) { if (c === '\\') i++; else if (c === q) q = null; }
+    else if (c === '"' || c === "'") q = c;
+    else if (c === '#') return s.slice(0, i);
+  }
+  return s;
+}
+function splitOps(s) {
+  const out = [];
+  let cur = '', q = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q) {
+      cur += c;
+      if (c === '\\') cur += s[++i] || '';
+      else if (c === q) q = null;
+    } else if (c === '"' || c === "'") { q = c; cur += c; }
+    else if (c === ',') { out.push(cur.trim()); cur = ''; }
+    else cur += c;
+  }
+  if (cur.trim() || out.length) out.push(cur.trim());
+  return out;
+}
+function atom(b, L, C) {
+  if (/^0x[\da-f]+$/i.test(b)) return parseInt(b, 16);
+  if (/^0b[01]+$/i.test(b)) return parseInt(b.slice(2), 2);
+  if (/^\d+$/.test(b)) return parseInt(b, 10);
+  if (b in C) return C[b];
+  if (b in L) return L[b];
+  throw new Error("undefined symbol '" + b + "'");
+}
+function evalExpr(s, L, C) {
+  s = s.trim();
+  if (!s) throw new Error('missing value');
+  if (s[0] === "'") return charVal(s);
+  const terms = s.replace(/\s+/g, '').match(/[+-]?[^+-]+/g);
+  if (!terms) throw new Error("bad expression '" + s + "'");
+  let tot = 0;
+  for (const t of terms) tot += (t[0] === '-' ? -1 : 1) * atom(t.replace(/^[+-]/, ''), L, C);
+  return tot;
+}
+
+const RR = new Set(['add','sub','sll','slt','sltu','xor','srl','sra','or','and','mul','mulh','mulhsu','mulhu','div','divu','rem','remu']);
+const RI = new Set(['addi','slti','sltiu','xori','ori','andi','slli','srli','srai']);
+const LD = new Set(['lb','lh','lw','lbu','lhu']);
+const ST = new Set(['sb','sh','sw']);
+const BR = new Set(['beq','bne','blt','bge','bltu','bgeu']);
+
+function build(it, L, C) {
+  const mn = it.mn, ops = it.ops, pc = TEXT + 4 * it.idx;
+  const R = reg, E = x => evalExpr(x, L, C);
+  const need = k => { if (ops.length !== k) throw new Error("'" + mn + "' expects " + k + ' operands'); };
+  const mem = s => {
+    const m = /^(.*)\(\s*([^)]+)\)\s*$/.exec(s);
+    if (m) return { base: R(m[2]), imm: m[1].trim() ? E(m[1]) : 0, sym: false };
+    return { base: 0, imm: E(s), sym: true };
+  };
+  const tgt = s => /^[+-]?\d+$/.test(s) ? pc + parseInt(s, 10) : E(s);
+  let o;
+  if (RR.has(mn)) { need(3); o = { o: mn, d: R(ops[0]), a: R(ops[1]), b: R(ops[2]) }; }
+  else if (RI.has(mn)) { need(3); o = { o: mn, d: R(ops[0]), a: R(ops[1]), imm: E(ops[2]) }; }
+  else if (LD.has(mn)) { need(2); const m = mem(ops[1]); o = { o: mn, d: R(ops[0]), a: m.base, imm: m.imm }; }
+  else if (ST.has(mn)) {
+    if (ops.length < 2 || ops.length > 3) throw new Error("'" + mn + "' expects 2 operands");
+    const m = mem(ops[1]);
+    o = { o: mn, b: R(ops[0]), a: m.base, imm: m.imm, t: (m.sym && ops[2]) ? R(ops[2]) : 0 };
+  }
+  else if (BR.has(mn)) { need(3); o = { o: mn, a: R(ops[0]), b: R(ops[1]), imm: tgt(ops[2]) }; }
+  else switch (mn) {
+    case 'lui': case 'auipc': need(2); o = { o: mn, d: R(ops[0]), imm: E(ops[1]) }; break;
+    case 'jal':
+      if (ops.length === 1) o = { o: 'jal', d: 1, imm: tgt(ops[0]) };
+      else { need(2); o = { o: 'jal', d: R(ops[0]), imm: tgt(ops[1]) }; }
+      break;
+    case 'jalr':
+      if (ops.length === 1) o = { o: 'jalr', d: 1, a: R(ops[0]), imm: 0 };
+      else if (ops.length === 2) {
+        if (/\(/.test(ops[1])) { const m = mem(ops[1]); o = { o: 'jalr', d: R(ops[0]), a: m.base, imm: m.imm }; }
+        else o = { o: 'jalr', d: R(ops[0]), a: R(ops[1]), imm: 0 };
+      } else o = { o: 'jalr', d: R(ops[0]), a: R(ops[1]), imm: E(ops[2]) };
+      break;
+    case 'li': case 'la': need(2); o = { o: 'li', d: R(ops[0]), imm: E(ops[1]) | 0 }; break;
+    case 'mv': need(2); o = { o: 'addi', d: R(ops[0]), a: R(ops[1]), imm: 0 }; break;
+    case 'not': need(2); o = { o: 'xori', d: R(ops[0]), a: R(ops[1]), imm: -1 }; break;
+    case 'neg': need(2); o = { o: 'sub', d: R(ops[0]), a: 0, b: R(ops[1]) }; break;
+    case 'seqz': need(2); o = { o: 'sltiu', d: R(ops[0]), a: R(ops[1]), imm: 1 }; break;
+    case 'snez': need(2); o = { o: 'sltu', d: R(ops[0]), a: 0, b: R(ops[1]) }; break;
+    case 'sltz': need(2); o = { o: 'slt', d: R(ops[0]), a: R(ops[1]), b: 0 }; break;
+    case 'sgtz': need(2); o = { o: 'slt', d: R(ops[0]), a: 0, b: R(ops[1]) }; break;
+    case 'nop': o = { o: 'addi', d: 0, a: 0, imm: 0 }; break;
+    case 'j': need(1); o = { o: 'jal', d: 0, imm: tgt(ops[0]) }; break;
+    case 'jr': need(1); o = { o: 'jalr', d: 0, a: R(ops[0]), imm: 0 }; break;
+    case 'ret': o = { o: 'jalr', d: 0, a: 1, imm: 0 }; break;
+    case 'call': need(1); o = { o: 'jal', d: 1, imm: tgt(ops[0]) }; break;
+    case 'tail': need(1); o = { o: 'jal', d: 0, imm: tgt(ops[0]) }; break;
+    case 'beqz': need(2); o = { o: 'beq', a: R(ops[0]), b: 0, imm: tgt(ops[1]) }; break;
+    case 'bnez': need(2); o = { o: 'bne', a: R(ops[0]), b: 0, imm: tgt(ops[1]) }; break;
+    case 'blez': need(2); o = { o: 'bge', a: 0, b: R(ops[0]), imm: tgt(ops[1]) }; break;
+    case 'bgez': need(2); o = { o: 'bge', a: R(ops[0]), b: 0, imm: tgt(ops[1]) }; break;
+    case 'bltz': need(2); o = { o: 'blt', a: R(ops[0]), b: 0, imm: tgt(ops[1]) }; break;
+    case 'bgtz': need(2); o = { o: 'blt', a: 0, b: R(ops[0]), imm: tgt(ops[1]) }; break;
+    case 'bgt': need(3); o = { o: 'blt', a: R(ops[1]), b: R(ops[0]), imm: tgt(ops[2]) }; break;
+    case 'ble': need(3); o = { o: 'bge', a: R(ops[1]), b: R(ops[0]), imm: tgt(ops[2]) }; break;
+    case 'bgtu': need(3); o = { o: 'bltu', a: R(ops[1]), b: R(ops[0]), imm: tgt(ops[2]) }; break;
+    case 'bleu': need(3); o = { o: 'bgeu', a: R(ops[1]), b: R(ops[0]), imm: tgt(ops[2]) }; break;
+    case 'ecall': o = { o: 'ecall' }; break;
+    case 'ebreak': o = { o: 'ebreak' }; break;
+    default: throw new Error("unknown instruction '" + mn + "'");
+  }
+  o.line = it.line;
+  return o;
+}
+
+function assemble(src) {
+  const labels = Object.create(null), consts = Object.create(null), errs = [];
+  const entries = src.split(/\r?\n/).map((raw, n) => {
+    let s = stripComment(raw), m;
+    const labs = [];
+    while ((m = /^\s*([A-Za-z_.$][\w.$]*)\s*:(.*)$/.exec(s))) { labs.push(m[1]); s = m[2]; }
+    return { line: n + 1, labs, txt: s.trim() };
+  });
+  let seg = 'text', dl = 0, pend = [];
+  const insts = [], ditems = [];
+  const bind = (addr, line) => {
+    for (const l of pend) {
+      if (l in labels) errs.push('line ' + line + ": label '" + l + "' defined twice");
+      else labels[l] = addr;
+    }
+    pend = [];
+  };
+  const align = n => { dl = (dl + n - 1) & ~(n - 1); };
+  for (const e of entries) {
+    try {
+      pend.push(...e.labs);
+      if (!e.txt) continue;
+      const m = /^(\S+)\s*(.*)$/.exec(e.txt);
+      const mn = m[1].toLowerCase(), rest = m[2].trim();
+      if (mn[0] === '.') {
+        switch (mn) {
+          case '.text': seg = 'text'; break;
+          case '.data': seg = 'data'; break;
+          case '.section': seg = /text/.test(rest) ? 'text' : 'data'; break;
+          case '.globl': case '.global': case '.type': case '.size': case '.file': case '.option': break;
+          case '.eqv': case '.equ': case '.set': {
+            const p = /^([^\s,]+)\s*,?\s*(.+)$/.exec(rest);
+            if (!p) throw new Error('bad ' + mn);
+            consts[p[1]] = evalExpr(p[2], labels, consts);
+            break;
+          }
+          case '.align': case '.p2align': if (seg === 'data') align(1 << evalExpr(rest, labels, consts)); break;
+          case '.balign': if (seg === 'data') align(evalExpr(rest, labels, consts)); break;
+          default: {
+            if (seg !== 'data') throw new Error(mn + ' outside .data');
+            if (mn === '.word' || mn === '.4byte') {
+              align(4); bind(DATA + dl, e.line);
+              const a = splitOps(rest);
+              ditems.push({ n: 4, off: dl, a, line: e.line }); dl += 4 * a.length;
+            } else if (mn === '.half' || mn === '.short' || mn === '.2byte') {
+              align(2); bind(DATA + dl, e.line);
+              const a = splitOps(rest);
+              ditems.push({ n: 2, off: dl, a, line: e.line }); dl += 2 * a.length;
+            } else if (mn === '.byte') {
+              bind(DATA + dl, e.line);
+              const a = splitOps(rest);
+              ditems.push({ n: 1, off: dl, a, line: e.line }); dl += a.length;
+            } else if (mn === '.ascii' || mn === '.asciz' || mn === '.string') {
+              bind(DATA + dl, e.line);
+              const bytes = [];
+              for (const t of splitOps(rest)) {
+                for (const b of enc.encode(unq(t))) bytes.push(b);
+                if (mn !== '.ascii') bytes.push(0);
+              }
+              ditems.push({ n: 0, off: dl, bytes }); dl += bytes.length;
+            } else if (mn === '.space' || mn === '.skip') {
+              bind(DATA + dl, e.line);
+              dl += evalExpr(rest, labels, consts);
+            } else throw new Error('unsupported directive ' + mn);
+          }
+        }
+      } else {
+        if (seg !== 'text') throw new Error('instruction in data segment');
+        const idx = insts.length;
+        bind(TEXT + 4 * idx, e.line);
+        insts.push({ mn, ops: splitOps(rest), line: e.line, idx });
+      }
+    } catch (err) { errs.push('line ' + e.line + ': ' + err.message); }
+  }
+  if (pend.length) bind(seg === 'text' ? TEXT + 4 * insts.length : DATA + dl, 0);
+  const init = [];
+  for (const d of ditems) {
+    try {
+      if (d.n === 0) d.bytes.forEach((b, k) => init.push([DATA + d.off + k, b, 1]));
+      else d.a.forEach((x, k) => init.push([DATA + d.off + k * d.n, evalExpr(x, labels, consts) | 0, d.n]));
+    } catch (err) { errs.push('line ' + d.line + ': ' + err.message); }
+  }
+  const prog = [];
+  for (const it of insts) {
+    try { prog.push(build(it, labels, consts)); }
+    catch (err) { errs.push('line ' + it.line + ': ' + err.message); }
+  }
+  if (errs.length) throw new Error(errs.join('\n'));
+  return { prog, init };
+}
+
+let regs = new Int32Array(32), pc = TEXT, insts = [], pages = new Map(), buf = '';
+let heap = 0x10040000, running = false, gen = 0, wake = null, ob = '', total = 0, code = 0;
+const rngs = new Map();
+
+function print(text, cls) {
+  const s = document.createElement('span');
+  if (cls) s.className = cls;
+  s.textContent = text;
+  term.appendChild(s);
+  term.scrollTop = term.scrollHeight;
+}
+function put(s) {
+  ob += s;
+  total += s.length;
+  if (total > 2 * 1024 * 1024) throw new Error('output limit hit');
+}
+function flush() { if (ob) { print(ob); ob = ''; } }
+function setRunning(on) { stdin.disabled = !on; if (on) stdin.focus(); }
+
+function rb(a) { const p = pages.get(a >>> 12); return p ? p[a & 4095] : 0; }
+function wb(a, v) {
+  const k = a >>> 12;
+  let p = pages.get(k);
+  if (!p) { p = new Uint8Array(4096); pages.set(k, p); }
+  p[a & 4095] = v;
+}
+function cstr(a) {
+  const bytes = [];
+  for (let k = 0; k < 1000000; k++) { const c = rb(a + k); if (!c) break; bytes.push(c); }
+  return dec.decode(new Uint8Array(bytes));
+}
+function takeLine() {
+  const i = buf.indexOf('\n');
+  let l;
+  if (i < 0) { l = buf; buf = ''; } else { l = buf.slice(0, i + 1); buf = buf.slice(i + 1); }
+  return l;
+}
+function mb(a) {
+  return () => {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function rng(id) {
+  if (!rngs.has(id)) rngs.set(id, mb(Date.now() ^ id));
+  return rngs.get(id);
+}
+
+function ecall() {
+  const n = regs[17], a = regs[10], b = regs[11];
+  switch (n) {
+    case 1: put(String(a)); return;
+    case 4: put(cstr(a >>> 0)); return;
+    case 5: {
+      if (!buf) return 'wait';
+      const t = takeLine().trim();
+      if (!/^[+-]?(\d+|0x[\da-f]+)$/i.test(t)) throw new Error('invalid integer input: ' + t);
+      regs[10] = parseInt(t, /0x/i.test(t) ? 16 : 10) | 0;
+      return;
+    }
+    case 8: {
+      if (!buf) return 'wait';
+      const bytes = enc.encode(takeLine());
+      const k = Math.max(0, Math.min(bytes.length, b - 1));
+      for (let j = 0; j < k; j++) wb((a + j) >>> 0, bytes[j]);
+      if (b > 0) wb((a + k) >>> 0, 0);
+      return;
+    }
+    case 9: regs[10] = heap; heap += a; return;
+    case 10: code = 0; running = false; return 'done';
+    case 11: put(String.fromCharCode(a & 255)); return;
+    case 12:
+      if (!buf) return 'wait';
+      regs[10] = buf.charCodeAt(0) & 255;
+      buf = buf.slice(1);
+      return;
+    case 17: code = a; running = false; return 'done';
+    case 30: {
+      const t = Date.now();
+      regs[10] = (t % 4294967296) | 0;
+      regs[11] = Math.floor(t / 4294967296);
+      return;
+    }
+    case 32: return Math.max(0, a);
+    case 34: put('0x' + (a >>> 0).toString(16).padStart(8, '0')); return;
+    case 35: put((a >>> 0).toString(2).padStart(32, '0')); return;
+    case 36: put(String(a >>> 0)); return;
+    case 40: rngs.set(a, mb(b)); return;
+    case 41: regs[10] = (rng(a)() * 4294967296) | 0; return;
+    case 42:
+      if (b <= 0) throw new Error('random upper bound must be positive');
+      regs[10] = Math.floor(rng(a)() * b) | 0;
+      return;
+    default: throw new Error('unsupported ecall ' + n);
+  }
+}
+
+function step() {
+  const i = insts[(pc - TEXT) >>> 2];
+  if (!i || pc < TEXT || (pc & 3)) {
+    if (pc === TEXT + 4 * insts.length) { put('\n[dropped off bottom]'); code = 0; running = false; return 'done'; }
+    throw new Error('jump to invalid address 0x' + (pc >>> 0).toString(16));
+  }
+  const r = regs;
+  let npc = pc + 4, ad;
+  switch (i.o) {
+    case 'add': r[i.d] = r[i.a] + r[i.b]; break;
+    case 'sub': r[i.d] = r[i.a] - r[i.b]; break;
+    case 'sll': r[i.d] = r[i.a] << (r[i.b] & 31); break;
+    case 'slt': r[i.d] = r[i.a] < r[i.b] ? 1 : 0; break;
+    case 'sltu': r[i.d] = (r[i.a] >>> 0) < (r[i.b] >>> 0) ? 1 : 0; break;
+    case 'xor': r[i.d] = r[i.a] ^ r[i.b]; break;
+    case 'srl': r[i.d] = r[i.a] >>> (r[i.b] & 31); break;
+    case 'sra': r[i.d] = r[i.a] >> (r[i.b] & 31); break;
+    case 'or': r[i.d] = r[i.a] | r[i.b]; break;
+    case 'and': r[i.d] = r[i.a] & r[i.b]; break;
+    case 'mul': r[i.d] = Math.imul(r[i.a], r[i.b]); break;
+    case 'mulh': r[i.d] = Number((BigInt(r[i.a]) * BigInt(r[i.b])) >> 32n) | 0; break;
+    case 'mulhsu': r[i.d] = Number((BigInt(r[i.a]) * BigInt(r[i.b] >>> 0)) >> 32n) | 0; break;
+    case 'mulhu': r[i.d] = Number((BigInt(r[i.a] >>> 0) * BigInt(r[i.b] >>> 0)) >> 32n) | 0; break;
+    case 'div': {
+      const x = r[i.a], y = r[i.b];
+      r[i.d] = y === 0 ? -1 : (x === -2147483648 && y === -1 ? x : (x / y) | 0);
+      break;
+    }
+    case 'divu': {
+      const x = r[i.a] >>> 0, y = r[i.b] >>> 0;
+      r[i.d] = y === 0 ? -1 : Math.floor(x / y) | 0;
+      break;
+    }
+    case 'rem': {
+      const x = r[i.a], y = r[i.b];
+      r[i.d] = y === 0 ? x : (x === -2147483648 && y === -1 ? 0 : (x % y) | 0);
+      break;
+    }
+    case 'remu': {
+      const x = r[i.a] >>> 0, y = r[i.b] >>> 0;
+      r[i.d] = y === 0 ? x | 0 : (x % y) | 0;
+      break;
+    }
+    case 'addi': r[i.d] = r[i.a] + i.imm; break;
+    case 'slti': r[i.d] = r[i.a] < i.imm ? 1 : 0; break;
+    case 'sltiu': r[i.d] = (r[i.a] >>> 0) < (i.imm >>> 0) ? 1 : 0; break;
+    case 'xori': r[i.d] = r[i.a] ^ i.imm; break;
+    case 'ori': r[i.d] = r[i.a] | i.imm; break;
+    case 'andi': r[i.d] = r[i.a] & i.imm; break;
+    case 'slli': r[i.d] = r[i.a] << (i.imm & 31); break;
+    case 'srli': r[i.d] = r[i.a] >>> (i.imm & 31); break;
+    case 'srai': r[i.d] = r[i.a] >> (i.imm & 31); break;
+    case 'lb': ad = (r[i.a] + i.imm) >>> 0; r[i.d] = (rb(ad) << 24) >> 24; break;
+    case 'lbu': ad = (r[i.a] + i.imm) >>> 0; r[i.d] = rb(ad); break;
+    case 'lh':
+      ad = (r[i.a] + i.imm) >>> 0;
+      if (ad & 1) throw new Error('unaligned halfword address 0x' + ad.toString(16));
+      r[i.d] = ((rb(ad) | (rb(ad + 1) << 8)) << 16) >> 16;
+      break;
+    case 'lhu':
+      ad = (r[i.a] + i.imm) >>> 0;
+      if (ad & 1) throw new Error('unaligned halfword address 0x' + ad.toString(16));
+      r[i.d] = rb(ad) | (rb(ad + 1) << 8);
+      break;
+    case 'lw':
+      ad = (r[i.a] + i.imm) >>> 0;
+      if (ad & 3) throw new Error('unaligned word address 0x' + ad.toString(16));
+      r[i.d] = rb(ad) | (rb(ad + 1) << 8) | (rb(ad + 2) << 16) | (rb(ad + 3) << 24);
+      break;
+    case 'sb': ad = (r[i.a] + i.imm) >>> 0; if (i.t) r[i.t] = ad; wb(ad, r[i.b] & 255); break;
+    case 'sh': {
+      ad = (r[i.a] + i.imm) >>> 0;
+      if (ad & 1) throw new Error('unaligned halfword address 0x' + ad.toString(16));
+      if (i.t) r[i.t] = ad;
+      const v = r[i.b];
+      wb(ad, v & 255); wb(ad + 1, (v >> 8) & 255);
+      break;
+    }
+    case 'sw': {
+      ad = (r[i.a] + i.imm) >>> 0;
+      if (ad & 3) throw new Error('unaligned word address 0x' + ad.toString(16));
+      if (i.t) r[i.t] = ad;
+      const v = r[i.b];
+      wb(ad, v & 255); wb(ad + 1, (v >> 8) & 255); wb(ad + 2, (v >> 16) & 255); wb(ad + 3, (v >> 24) & 255);
+      break;
+    }
+    case 'beq': if (r[i.a] === r[i.b]) npc = i.imm; break;
+    case 'bne': if (r[i.a] !== r[i.b]) npc = i.imm; break;
+    case 'blt': if (r[i.a] < r[i.b]) npc = i.imm; break;
+    case 'bge': if (r[i.a] >= r[i.b]) npc = i.imm; break;
+    case 'bltu': if ((r[i.a] >>> 0) < (r[i.b] >>> 0)) npc = i.imm; break;
+    case 'bgeu': if ((r[i.a] >>> 0) >= (r[i.b] >>> 0)) npc = i.imm; break;
+    case 'jal': r[i.d] = pc + 4; npc = i.imm; break;
+    case 'jalr': { const t = (r[i.a] + i.imm) & ~1; r[i.d] = pc + 4; npc = t; break; }
+    case 'li': r[i.d] = i.imm; break;
+    case 'lui': r[i.d] = i.imm << 12; break;
+    case 'auipc': r[i.d] = pc + (i.imm << 12); break;
+    case 'ecall': {
+      const st = ecall();
+      if (st === 'wait') return st;
+      pc = npc; r[0] = 0;
+      return st;
+    }
+    case 'ebreak': put('\n[ebreak]'); code = 0; running = false; return 'done';
+  }
+  pc = npc;
+  r[0] = 0;
+}
+
+async function exec(g) {
+  try {
+    while (running && g === gen) {
+      let st, k = 0;
+      while (k++ < 20000) { st = step(); if (st !== undefined) break; }
+      flush();
+      if (!running || g !== gen) break;
+      if (st === 'wait') await new Promise(res => { wake = res; });
+      else if (typeof st === 'number') await new Promise(res => setTimeout(res, st));
+      else await new Promise(res => setTimeout(res, 0));
+    }
+  } catch (e) {
+    if (g === gen) {
+      flush();
+      const i = insts[(pc - TEXT) >>> 2];
+      print('\n[error' + (i ? ' at line ' + i.line : '') + ': ' + e.message + ']\n', 'err');
+      running = false;
+      setRunning(false);
+    }
+    return;
+  }
+  if (g === gen) {
+    flush();
+    print('\n[exit: ' + code + ']\n', 'sys');
+    running = false;
+    setRunning(false);
+  }
+}
+
+let lastName = null, lastSrc = null;
+
+function stop() {
+  gen++;
+  running = false;
+  if (wake) { const w = wake; wake = null; w(); }
+}
+
+function start(name, src) {
+  stop();
+  lastName = name; lastSrc = src;
+  term.textContent = '';
+  ob = ''; total = 0;
+  status.textContent = name;
+  print('$ rars nc ' + name + '\n', 'sys');
+  let res;
+  try { res = assemble(src); }
+  catch (e) { print(e.message + '\n', 'err'); setRunning(false); return; }
+  regs.fill(0);
+  regs[2] = 0x7fffeffc;
+  regs[3] = 0x10008000;
+  pages.clear(); rngs.clear();
+  buf = ''; heap = 0x10040000; pc = TEXT; code = 0;
+  insts = res.prog;
+  for (const [a, v, n] of res.init) for (let k = 0; k < n; k++) wb(a + k, (v >>> (8 * k)) & 255);
+  running = true;
+  setRunning(true);
+  exec(gen);
+}
+
+async function openFile(file) {
+  if (!file) return;
+  start(file.name, await file.text());
+}
+
+stdin.addEventListener('keydown', e => {
+  if (e.key !== 'Enter' || !running) return;
+  const text = stdin.value + '\n';
+  stdin.value = '';
+  flush();
+  print(text, 'in');
+  buf += text;
+  if (wake) { const w = wake; wake = null; w(); }
 });
 
-// debug: shows what the console really listens for if you type into it by hand
-['keydown','keypress','keyup','input','beforeinput'].forEach(t =>
-  con.addEventListener(t, e => console.log('console got', t, e.key, 'trusted:', e.isTrusted)));
-
-// 3. run the jar the way that already worked
-const ready = cheerpjInit();
-ready.then(() => { $('status').textContent = 'Drop a .s file anywhere'; });
-
-async function run(file) {
-  if (!file) return;
-  if (started) { location.reload(); return; }
-  started = true;
-  await ready;
-  const name = file.name.replace(/[^\w.-]/g, '_');
-  cheerpOSAddStringFile('/str/' + name, await file.text());
-  $('status').textContent = name;
-  $('stdin').focus();
-  const code = await cheerpjRunJar('/app/rars1_6.jar', 'nc', '/str/' + name);
-  out.append(`\n[exit: ${code}]\n`);
-}
-
 $('pick').onclick = () => $('file').click();
-$('file').onchange = e => { run(e.target.files[0]); e.target.value = ''; };
-$('rerun').onclick = () => location.reload();
-addEventListener('dragover', e => e.preventDefault());
-addEventListener('drop', e => { e.preventDefault(); run(e.dataTransfer.files[0]); });
+$('file').onchange = e => { openFile(e.target.files[0]); e.target.value = ''; };
+$('rerun').onclick = () => { if (lastSrc !== null) start(lastName, lastSrc); };
+$('kill').onclick = () => {
+  if (!running) return;
+  stop();
+  flush();
+  print('\n[stopped]\n', 'sys');
+  setRunning(false);
+};
+$('clear').onclick = () => { term.textContent = ''; };
+
+addEventListener('dragover', e => { e.preventDefault(); document.body.classList.add('drag'); });
+addEventListener('dragleave', e => { if (!e.relatedTarget) document.body.classList.remove('drag'); });
+addEventListener('drop', e => {
+  e.preventDefault();
+  document.body.classList.remove('drag');
+  openFile(e.dataTransfer.files[0]);
+});
 </script>
 </body>
 </html>
