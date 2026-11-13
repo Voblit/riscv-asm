@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RARS Console</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { height: 100%; margin: 0; background: #0a0a0a; color: #4ade80;
+    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  body { display: flex; flex-direction: column; }
+  header { display: flex; gap: 10px; align-items: center; padding: 8px 12px; background: #161616;
+    border-bottom: 1px solid #2a2a2a; color: #aaa; font-family: system-ui, sans-serif; }
+  header button { background: #2a2a2a; color: #ddd; border: 0; border-radius: 4px; padding: 5px 12px; cursor: pointer; }
+  header span { flex: 1; text-align: right; }
+  #term { flex: 1; margin: 0; padding: 12px; overflow-y: auto; white-space: pre-wrap; word-break: break-word; }
+  .err { color: #f87171; } .sys { color: #60a5fa; } .in { color: #fbbf24; }
+  #line { display: flex; border-top: 1px solid #2a2a2a; }
+  #line b { padding: 8px 0 8px 12px; color: #fbbf24; }
+  #stdin { flex: 1; background: transparent; border: 0; outline: 0; color: #fbbf24; font: inherit; padding: 8px; }
+  body.drag #term { outline: 2px dashed #60a5fa; outline-offset: -8px; }
+</style>
+</head>
+<body>
+<header>
+  <button id="pick">Open .s file</button>
+  <button id="rerun">Re-run</button>
+  <button id="kill">Stop</button>
+  <button id="clear">Clear</button>
+  <span id="status">Drop a .s file anywhere</span>
+  <input type="file" id="file" accept=".s,.asm,.S,.txt" hidden>
+</header>
+<pre id="term"></pre>
+<div id="line"><b>&gt;</b><input id="stdin" placeholder="stdin (Enter to send)" autocomplete="off" disabled></div>
+<script>
+const $ = id => document.getElementById(id);
+const term = $('term'), stdin = $('stdin'), status = $('status');
+let es = null, sid = null, lastFile = null;
+
+function print(text, cls) {
+  const s = document.createElement('span');
+  if (cls) s.className = cls;
+  s.textContent = text;
+  term.appendChild(s);
+  term.scrollTop = term.scrollHeight;
+}
+function setRunning(on) { stdin.disabled = !on; if (on) stdin.focus(); }
+
+async function run(file) {
+  if (!file) return;
+  lastFile = file;
+  if (es) es.close();
+  term.textContent = '';
+  status.textContent = file.name;
+  print(`$ rars nc ${file.name}\n`, 'sys');
+  const r = await fetch('/run?name=' + encodeURIComponent(file.name), { method: 'POST', body: await file.text() });
+  if (!r.ok) { print(await r.text() + '\n', 'err'); return; }
+  sid = (await r.json()).id;
+  setRunning(true);
+  es = new EventSource('/stream/' + sid);
+  es.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if (m.t === 'exit') { print(`\n[exit: ${m.d}]\n`, 'sys'); es.close(); sid = null; setRunning(false); }
+    else print(m.d, m.t === 'err' ? 'err' : '');
+  };
+  es.onerror = () => { es.close(); setRunning(false); };
+}
+
+stdin.addEventListener('keydown', e => {
+  if (e.key !== 'Enter' || !sid) return;
+  const text = stdin.value + '\n';
+  print(text, 'in');
+  stdin.value = '';
+  fetch('/stdin/' + sid, { method: 'POST', body: text });
+});
+
+$('pick').onclick = () => $('file').click();
+$('file').onchange = e => { run(e.target.files[0]); e.target.value = ''; };
+$('rerun').onclick = () => run(lastFile);
+$('kill').onclick = () => sid && fetch('/kill/' + sid, { method: 'POST' });
+$('clear').onclick = () => { term.textContent = ''; };
+
+addEventListener('dragover', e => { e.preventDefault(); document.body.classList.add('drag'); });
+addEventListener('dragleave', e => { if (!e.relatedTarget) document.body.classList.remove('drag'); });
+addEventListener('drop', e => {
+  e.preventDefault();
+  document.body.classList.remove('drag');
+  run(e.dataTransfer.files[0]);
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+{
+  "name": "riscv-asm-console",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Headless RARS console: drop a .s file, see output.",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" }
+}
