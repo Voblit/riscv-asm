@@ -7,14 +7,17 @@
 <style>
   :root { color-scheme: dark; }
   html, body { height: 100%; margin: 0; background: #0a0a0a; color: #4ade80;
-    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    font: 14px/1.5 ui-monospace, Menlo, Consolas, monospace; }
   body { display: flex; flex-direction: column; }
-  header { display: flex; gap: 10px; align-items: center; padding: 8px 12px; background: #161616;
-    border-bottom: 1px solid #2a2a2a; color: #aaa; font-family: system-ui, sans-serif; }
-  header button { background: #2a2a2a; color: #ddd; border: 0; border-radius: 4px; padding: 5px 12px; cursor: pointer; }
+  header { display: flex; gap: 10px; align-items: center; padding: 8px 12px; background: #161616; color: #aaa; font-family: system-ui, sans-serif; }
+  header button { background: #2a2a2a; color: #ddd; border: 0; border-radius: 4px; padding: 5px 12px; }
   header span { flex: 1; text-align: right; }
-  #console { flex: 1; margin: 0; padding: 12px; overflow-y: auto; white-space: pre-wrap; outline: 0; }
-  body.drag #console { outline: 2px dashed #60a5fa; outline-offset: -8px; }
+  #out { flex: 1; margin: 0; padding: 12px; overflow-y: auto; white-space: pre-wrap; word-break: break-word; }
+  #line { display: flex; border-top: 1px solid #2a2a2a; }
+  #line b { padding: 8px 0 8px 12px; color: #fbbf24; }
+  #stdin { flex: 1; background: transparent; border: 0; outline: 0; color: #fbbf24; font: inherit; padding: 8px; }
+  /* the real CheerpJ console: present and focusable, but not visible */
+  #console { position: fixed; left: -9999px; top: 0; width: 600px; height: 200px; overflow: auto; }
 </style>
 </head>
 <body>
@@ -24,44 +27,70 @@
   <span id="status">Loading Java runtime…</span>
   <input type="file" id="file" accept=".s,.asm,.S,.txt" hidden>
 </header>
-<pre id="console"></pre>
+<pre id="out"></pre>
+<div id="line"><b>&gt;</b><input id="stdin" placeholder="stdin (Enter to send)" autocomplete="off"></div>
+<pre id="console" tabindex="0"></pre>
 
 <script src="https://cjrtnc.leaningtech.com/3.0/cj3loader.js"></script>
 <script>
 const $ = id => document.getElementById(id);
-let lastFile = null;
-let running = false;
+const con = $('console'), out = $('out');
+let started = false;
 
+// 1. mirror everything CheerpJ prints into our own view
+new MutationObserver(() => {
+  out.textContent = con.textContent;
+  out.scrollTop = out.scrollHeight;
+}).observe(con, { childList: true, characterData: true, subtree: true });
+
+// 2. our input box -> keystrokes into the hidden console
+function press(ch) {
+  const enter = ch === 'Enter';
+  const code = enter ? 13 : ch.charCodeAt(0);
+  const init = { key: ch, code: enter ? 'Enter' : '', keyCode: code, charCode: code,
+                 which: code, bubbles: true, cancelable: true };
+  con.dispatchEvent(new KeyboardEvent('keydown', init));
+  con.dispatchEvent(new KeyboardEvent('keypress', init));
+  if (!enter) con.dispatchEvent(new InputEvent('input', { data: ch, inputType: 'insertText', bubbles: true }));
+  con.dispatchEvent(new KeyboardEvent('keyup', init));
+}
+
+$('stdin').addEventListener('keydown', e => {
+  if (e.key !== 'Enter') return;
+  e.preventDefault();
+  con.focus();
+  for (const ch of e.target.value) press(ch);
+  press('Enter');
+  e.target.value = '';
+  e.target.focus();
+});
+
+// debug: shows what the console really listens for if you type into it by hand
+['keydown','keypress','keyup','input','beforeinput'].forEach(t =>
+  con.addEventListener(t, e => console.log('console got', t, e.key, 'trusted:', e.isTrusted)));
+
+// 3. run the jar the way that already worked
 const ready = cheerpjInit();
 ready.then(() => { $('status').textContent = 'Drop a .s file anywhere'; });
 
 async function run(file) {
   if (!file) return;
-  if (running) { location.reload(); return; }   // one run per page load is the safe path
-  running = true;
-  lastFile = file;
+  if (started) { location.reload(); return; }
+  started = true;
   await ready;
-  const text = await file.text();
   const name = file.name.replace(/[^\w.-]/g, '_');
-  cheerpOSAddStringFile('/str/' + name, text);
+  cheerpOSAddStringFile('/str/' + name, await file.text());
   $('status').textContent = name;
-  $('console').textContent = '';
+  $('stdin').focus();
   const code = await cheerpjRunJar('/app/rars1_6.jar', 'nc', '/str/' + name);
-  $('console').append(`\n[exit: ${code}]\n`);
-  running = false;
+  out.append(`\n[exit: ${code}]\n`);
 }
 
 $('pick').onclick = () => $('file').click();
 $('file').onchange = e => { run(e.target.files[0]); e.target.value = ''; };
-$('rerun').onclick = () => lastFile && location.reload();
-
-addEventListener('dragover', e => { e.preventDefault(); document.body.classList.add('drag'); });
-addEventListener('dragleave', e => { if (!e.relatedTarget) document.body.classList.remove('drag'); });
-addEventListener('drop', e => {
-  e.preventDefault();
-  document.body.classList.remove('drag');
-  run(e.dataTransfer.files[0]);
-});
+$('rerun').onclick = () => location.reload();
+addEventListener('dragover', e => e.preventDefault());
+addEventListener('drop', e => { e.preventDefault(); run(e.dataTransfer.files[0]); });
 </script>
 </body>
 </html>
